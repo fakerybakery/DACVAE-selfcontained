@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -97,18 +96,23 @@ class NormConv1d(nn.Conv1d):
             **kwargs
         )
 
-        apply_parametrization_norm(self, norm)
+        if norm == "weight_norm":
+            weight_norm(self)
+
         self.causal = causal
         self.pad_mode = pad_mode
+        self._kernel_size = kernel_size
+        self._stride = stride
+        self._dilation = dilation
 
-    def pad(self, x: Tensor) -> Tensor:
+    def _pad(self, x: Tensor) -> Tensor:
         if self.pad_mode == "none":
             return x
 
         length = x.shape[-1]
-        kernel_size = self.kernel_size[0] if isinstance(self.kernel_size, tuple) else self.kernel_size
-        dilation = self.dilation[0] if isinstance(self.dilation, tuple) else self.dilation
-        stride = self.stride[0] if isinstance(self.stride, tuple) else self.stride
+        kernel_size = self._kernel_size
+        dilation = self._dilation
+        stride = self._stride
 
         effective_kernel_size = (kernel_size - 1) * dilation + 1
         padding_total = effective_kernel_size - stride
@@ -126,12 +130,12 @@ class NormConv1d(nn.Conv1d):
         return pad_x
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.pad(x)
+        x = self._pad(x)
         return super().forward(x)
 
 
 class NormConvTranspose1d(nn.ConvTranspose1d):
-    """1D Transposed Convolution with optional weight normalization and causal unpadding."""
+    """1D Transposed Convolution with optional weight normalization."""
 
     def __init__(
         self,
@@ -163,17 +167,21 @@ class NormConvTranspose1d(nn.ConvTranspose1d):
             **kwargs
         )
 
-        apply_parametrization_norm(self, norm)
+        if norm == "weight_norm":
+            weight_norm(self)
+
         self.causal = causal
         self.pad_mode = pad_mode
+        self._kernel_size = kernel_size
+        self._stride = stride
 
-    def unpad(self, x: Tensor) -> Tensor:
+    def _unpad(self, x: Tensor) -> Tensor:
         if self.pad_mode == "none":
             return x
 
         length = x.shape[-1]
-        kernel_size = self.kernel_size[0] if isinstance(self.kernel_size, tuple) else self.kernel_size
-        stride = self.stride[0] if isinstance(self.stride, tuple) else self.stride
+        kernel_size = self._kernel_size
+        stride = self._stride
 
         padding_total = kernel_size - stride
         if self.causal:
@@ -188,7 +196,7 @@ class NormConvTranspose1d(nn.ConvTranspose1d):
 
     def forward(self, x: Tensor) -> Tensor:
         y = super().forward(x)
-        return self.unpad(y)
+        return self._unpad(y)
 
 
 # --------------------------------------------------------------------
@@ -308,11 +316,17 @@ class Encoder(nn.Module):
 
 
 # --------------------------------------------------------------------
-# Decoder
+# Decoder with Watermarking
 # --------------------------------------------------------------------
 
 default_decoder_convtr_kwargs = {
     "acts": ["Snake", "ELU"],
+    "pad_mode": ["none", "auto"],
+    "norm": ["weight_norm", "none"],
+}
+
+default_wm_encoder_kwargs = {
+    "acts": ["Snake", "Tanh"],
     "pad_mode": ["none", "auto"],
     "norm": ["weight_norm", "none"],
 }
@@ -395,22 +409,34 @@ class DecoderBlock(nn.Module):
         group = nn.Sequential(*group)
         return group(x)
 
-    def upsample_group(self):
+    def upsample_group(self) -> nn.Sequential:
         layer_cnt = len(self.block)
         chunks = [self.block[i:i + self._chunk_size] for i in range(0, layer_cnt, self._chunk_size)]
         group = [layer for j, chunk in enumerate(chunks) if j % self._chunk_size != 0 for layer in chunk]
         return nn.Sequential(*group[(len(group) // 2):])
 
-    def downsample_group(self):
+    def downsample_group(self) -> nn.Sequential:
         layer_cnt = len(self.block)
         chunks = [self.block[i:i + self._chunk_size] for i in range(0, layer_cnt, self._chunk_size)]
         group = [layer for j, chunk in enumerate(chunks) if j % self._chunk_size != 0 for layer in chunk]
         return nn.Sequential(*group[:(len(group) // 2)])
 
 
-# --------------------------------------------------------------------
-# Watermarking (simplified, no LSTM)
-# --------------------------------------------------------------------
+class LSTMBlock(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, skip: bool = True):
+        super().__init__()
+        self.skip = skip
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, C, T) -> (T, B, C)
+        x = x.permute(2, 0, 1)
+        y, _ = self.lstm(x)
+        if self.skip:
+            y = y + x
+        # (T, B, C) -> (B, C, T)
+        return y.permute(1, 2, 0)
+
 
 class MsgProcessor(nn.Module):
     """Apply the secret message to the encoder output."""
@@ -433,20 +459,6 @@ class MsgProcessor(nn.Module):
         return hidden
 
 
-class LSTMBlock(nn.Module):
-    def __init__(self, *args, skip: bool = True, **kwargs):
-        super().__init__()
-        self.skip = skip
-        self.lstm = nn.LSTM(*args, **kwargs)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = x.permute(2, 0, 1)
-        y, _ = self.lstm(x)
-        if self.skip:
-            y = y + x
-        return y.permute(1, 2, 0)
-
-
 class WatermarkEncoderBlock(nn.Module):
     def __init__(
         self,
@@ -455,20 +467,47 @@ class WatermarkEncoderBlock(nn.Module):
         wm_channels: int = 32,
         hidden: int = 512,
         lstm_layers: Optional[int] = None,
+        acts: Optional[List[str]] = None,
+        pad_modes: Optional[List[str]] = None,
+        norms: Optional[List[str]] = None,
     ):
         super().__init__()
 
-        pre_layers = [
-            activation(act="Snake", channels=in_dim),
-            NormConv1d(in_dim, 1, kernel_size=7, causal=False, pad_mode="none", norm="weight_norm"),
-            activation(act="Tanh"),
-            NormConv1d(1, wm_channels, kernel_size=7, causal=True, pad_mode="auto", norm="none"),
-        ]
+        if acts is None:
+            acts = default_wm_encoder_kwargs["acts"]
+        if pad_modes is None:
+            pad_modes = default_wm_encoder_kwargs["pad_mode"]
+        if norms is None:
+            norms = default_wm_encoder_kwargs["norm"]
+
+        # pre: Snake(in_dim) -> Conv(in_dim -> 1) -> Tanh -> Conv(1 -> wm_channels)
+        pre_layers = []
+        for i, (act, norm, pad_mode) in enumerate(zip(acts, norms, pad_modes)):
+            input_dim = in_dim if i == 0 else 1
+            output_dim = 1 if i == 0 else wm_channels
+            if act == "Snake":
+                act_params = {"channels": in_dim}
+                causal = False
+            else:  # Tanh
+                act_params = {}
+                causal = True
+            pre_layers += [
+                activation(act=act, **act_params),
+                NormConv1d(
+                    input_dim,
+                    output_dim,
+                    kernel_size=7,
+                    causal=causal,
+                    pad_mode=pad_mode,
+                    norm=norm,
+                ),
+            ]
         self.pre = nn.Sequential(*pre_layers)
 
+        # post: LSTM(hidden) -> ELU -> Conv(hidden -> out_dim)
         post_layers = []
         if lstm_layers is not None:
-            post_layers += [LSTMBlock(hidden, hidden, lstm_layers)]
+            post_layers.append(LSTMBlock(hidden, hidden, lstm_layers))
         post_layers += [
             nn.ELU(alpha=1.0),
             NormConv1d(hidden, out_dim, kernel_size=7, causal=True, norm="none", pad_mode="auto"),
@@ -476,7 +515,18 @@ class WatermarkEncoderBlock(nn.Module):
         self.post = nn.Sequential(*post_layers)
 
     def forward(self, x: Tensor) -> Tensor:
+        """Full forward through pre layers."""
         return self.pre(x)
+
+    def forward_no_conv(self, x: Tensor) -> Tensor:
+        """Forward through pre layers, but skip the last conv (output is 1 channel)."""
+        # pre[0] = Snake, pre[1] = Conv(in->1), pre[2] = Tanh, pre[3] = Conv(1->wm_channels)
+        # forward_no_conv: Snake -> Conv(in->1) -> Tanh, skip last conv
+        for i, layer in enumerate(self.pre):
+            if i == len(self.pre) - 1:
+                break  # skip last conv
+            x = layer(x)
+        return x
 
     def post_process(self, x: Tensor) -> Tensor:
         return self.post(x)
@@ -493,18 +543,19 @@ class WatermarkDecoderBlock(nn.Module):
     ):
         super().__init__()
 
+        # pre: Conv(in_dim -> hidden) -> LSTM
         pre_layers = [
             NormConv1d(in_dim, hidden, kernel_size=7, causal=True, norm="none", pad_mode="auto"),
         ]
         if lstm_layers is not None:
-            pre_layers += [LSTMBlock(hidden, hidden, lstm_layers)]
+            pre_layers.append(LSTMBlock(hidden, hidden, lstm_layers))
         self.pre = nn.Sequential(*pre_layers)
 
-        post_layers = [
+        # post: ELU -> Conv(channels -> out_dim)
+        self.post = nn.Sequential(
             nn.ELU(alpha=1.0),
             NormConv1d(channels, out_dim, kernel_size=7, causal=True, norm="none", pad_mode="auto"),
-        ]
-        self.post = nn.Sequential(*post_layers)
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.pre(x)
@@ -530,14 +581,8 @@ class Watermarker(nn.Module):
         self.decoder_block = WatermarkDecoderBlock(d_latent, d_out, channels, hidden=hidden, lstm_layers=lstm_layers)
 
     def random_message(self, bsz: int) -> Tensor:
-        nbits = self.msg_processor.nbits if self.msg_processor is not None else 16
+        nbits = self.msg_processor.nbits
         return torch.randint(0, 2, (bsz, nbits), dtype=torch.float32)
-
-    def forward(self, x: Tensor, msg: Tensor) -> Tensor:
-        x = self.encoder_block(x)
-        x = self.msg_processor(x, msg)
-        x = self.decoder_block(x)
-        return x
 
 
 class Decoder(nn.Module):
@@ -557,10 +602,11 @@ class Decoder(nn.Module):
 
         layers = [NormConv1d(input_channel, channels, kernel_size=7, stride=1)]
 
+        output_dim = channels
         for i, (stride, wm_stride) in enumerate(zip(rates, wm_rates)):
             input_dim = channels // 2**i
             output_dim = channels // 2 ** (i + 1)
-            layers += [DecoderBlock(input_dim, output_dim, stride, wm_stride)]
+            layers.append(DecoderBlock(input_dim, output_dim, stride, wm_stride))
 
         self.model = nn.ModuleList(layers)
 
@@ -579,31 +625,42 @@ class Decoder(nn.Module):
         if self.alpha == 0.0:
             return x
 
+        # Encode through watermark encoder
         h = self.wm_model.encoder_block(x)
-        upsampler = list(map(lambda layer: layer.upsample_group(), self.model[1:]))[::-1]
+
+        # Upsample through decoder blocks (reversed)
+        upsampler = [block.upsample_group() for block in self.model[1:]][::-1]
         for layer in upsampler:
             h = layer(h)
+
+        # Post-process encoder
         h = self.wm_model.encoder_block.post_process(h)
 
+        # Apply message
         if message is None:
             bsz = x.shape[0]
             message = self.wm_model.random_message(bsz)
-
         message = message.to(x.device)
         h = self.wm_model.msg_processor(h, message)
+
+        # Decode through watermark decoder
         h = self.wm_model.decoder_block(h)
 
-        downsampler = list(map(lambda layer: layer.downsample_group(), self.model[1:]))
+        # Downsample through decoder blocks
+        downsampler = [block.downsample_group() for block in self.model[1:]]
         for layer in downsampler:
             h = layer(h)
+
+        # Post-process decoder -> output is (B, 1, T)
         h = self.wm_model.decoder_block.post_process(h)
 
+        # Blend: linear blending uses forward_no_conv which outputs 1 channel
         if self.blending == "conv":
-            return self.wm_model.encoder_block.forward(x) + self.alpha * h
+            out = self.wm_model.encoder_block.forward(x) + self.alpha * h
         else:
-            # Linear blending - bypass the conv in encoder_block
-            # This is a simplified version
-            return x + self.alpha * h
+            out = self.wm_model.encoder_block.forward_no_conv(x) + self.alpha * h
+
+        return out
 
 
 # --------------------------------------------------------------------
@@ -627,7 +684,7 @@ class VAEBottleneck(nn.Module):
         mean, scale = self.in_proj(z).chunk(2, dim=1)
         z_q, kl = self._vae_sample(mean, scale)
         z_q = self.out_proj(z_q)
-        return z_q, torch.zeros(z_q.size()), z_q, kl, torch.tensor(0.0)
+        return z_q, torch.zeros(z_q.size(), device=z.device), z_q, kl, torch.tensor(0.0, device=z.device)
 
     def _vae_sample(self, mean: Tensor, scale: Tensor) -> Tuple[Tensor, Tensor]:
         stdev = F.softplus(scale) + 1e-4
@@ -636,18 +693,6 @@ class VAEBottleneck(nn.Module):
         latents = torch.randn_like(mean) * stdev + mean
         kl = (mean * mean + var - logvar - 1).sum(1).mean()
         return latents, kl
-
-    def encode(self, z: Tensor) -> Tensor:
-        """Encode to latent space (for inference, uses mean only)."""
-        mean, scale = self.in_proj(z).chunk(2, dim=1)
-        stdev = F.softplus(scale) + 1e-4
-        # During inference, sample or just use mean
-        latents = torch.randn_like(mean) * stdev + mean
-        return latents
-
-    def decode(self, latents: Tensor) -> Tensor:
-        """Decode from latent space."""
-        return self.out_proj(latents)
 
 
 # --------------------------------------------------------------------
@@ -711,10 +756,8 @@ class DACVAE(nn.Module):
         return wavs
 
     def preprocess(self, audio_data: Tensor, sample_rate: Optional[int] = None) -> Tensor:
-        if sample_rate is None:
-            sample_rate = self.sample_rate
-        assert sample_rate == self.sample_rate
-
+        if sample_rate is not None:
+            assert sample_rate == self.sample_rate
         length = audio_data.shape[-1]
         right_pad = math.ceil(length / self.hop_length) * self.hop_length - length
         audio_data = F.pad(audio_data, (0, right_pad))
@@ -731,7 +774,7 @@ class DACVAE(nn.Module):
         Returns
         -------
         Tensor[B x D x T']
-            Continuous latent representation
+            Continuous latent representation (D = codebook_dim = 128)
         """
         z = self.encoder(self._pad(audio_data))
         mean, scale = self.quantizer.in_proj(z).chunk(2, dim=1)
@@ -762,21 +805,7 @@ class DACVAE(nn.Module):
         audio_data: Tensor,
         sample_rate: Optional[int] = None,
     ) -> dict:
-        """Full forward pass: encode and decode.
-
-        Parameters
-        ----------
-        audio_data : Tensor[B x 1 x T]
-            Audio data
-        sample_rate : int, optional
-            Sample rate (must match model's sample rate)
-
-        Returns
-        -------
-        dict with keys:
-            - "audio": reconstructed audio
-            - "latent": continuous latent representation
-        """
+        """Full forward pass: encode and decode."""
         length = audio_data.shape[-1]
         audio_data = self.preprocess(audio_data, sample_rate)
         latent = self.encode(audio_data)
@@ -788,25 +817,14 @@ class DACVAE(nn.Module):
 
     @classmethod
     def load(cls, path: str) -> "DACVAE":
-        """Load model from path or HuggingFace hub.
-
-        Parameters
-        ----------
-        path : str
-            Local path to weights.pth or HuggingFace repo ID (e.g., "facebook/dacvae-watermarked")
-
-        Returns
-        -------
-        DACVAE
-            Loaded model
-        """
+        """Load model from path or HuggingFace hub."""
         if not os.path.exists(path):
             if path.startswith("facebook/"):
                 try:
                     from huggingface_hub import hf_hub_download
                     path = hf_hub_download(repo_id=path, filename="weights.pth")
                 except ImportError:
-                    raise ImportError("huggingface_hub is required to download from HuggingFace. Install with: pip install huggingface-hub")
+                    raise ImportError("huggingface_hub required for HuggingFace downloads")
 
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
@@ -814,7 +832,6 @@ class DACVAE(nn.Module):
             kwargs = checkpoint["metadata"]["kwargs"]
             model = cls(**kwargs)
         else:
-            # Fallback to default config
             model = cls()
 
         if "state_dict" in checkpoint:
@@ -834,7 +851,7 @@ class DACVAE(nn.Module):
 
 
 # --------------------------------------------------------------------
-# Convenience functions for use with diffusion model
+# Convenience functions
 # --------------------------------------------------------------------
 
 def load_dacvae(
@@ -842,22 +859,7 @@ def load_dacvae(
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
 ) -> DACVAE:
-    """Load DAC-VAE model.
-
-    Parameters
-    ----------
-    path : str
-        Path to weights or HuggingFace repo ID
-    device : str
-        Device to load model on
-    dtype : torch.dtype
-        Data type for model parameters
-
-    Returns
-    -------
-    DACVAE
-        Loaded model in eval mode
-    """
+    """Load DAC-VAE model."""
     model = DACVAE.load(path)
     model = model.to(device=device, dtype=dtype)
     model.eval()
@@ -865,65 +867,21 @@ def load_dacvae(
 
 
 @torch.inference_mode()
-def encode_audio(
-    model: DACVAE,
-    audio: Tensor,
-) -> Tensor:
-    """Encode audio to latent representation.
-
-    Parameters
-    ----------
-    model : DACVAE
-        DAC-VAE model
-    audio : Tensor[B x 1 x T] or Tensor[B x T]
-        Audio waveform at model's sample rate
-
-    Returns
-    -------
-    Tensor[B x D x T']
-        Latent representation where D=codebook_dim (128) and T'=T/hop_length
-    """
+def encode_audio(model: DACVAE, audio: Tensor) -> Tensor:
+    """Encode audio to latent representation."""
     if audio.ndim == 2:
         audio = audio.unsqueeze(1)
     return model.encode(audio)
 
 
 @torch.inference_mode()
-def decode_latent(
-    model: DACVAE,
-    latent: Tensor,
-    message: Optional[Tensor] = None,
-) -> Tensor:
-    """Decode latent representation to audio.
-
-    Parameters
-    ----------
-    model : DACVAE
-        DAC-VAE model
-    latent : Tensor[B x D x T']
-        Latent representation
-    message : Tensor[B x nbits], optional
-        Watermark message
-
-    Returns
-    -------
-    Tensor[B x 1 x T]
-        Decoded audio waveform
-    """
+def decode_latent(model: DACVAE, latent: Tensor, message: Optional[Tensor] = None) -> Tensor:
+    """Decode latent representation to audio."""
     return model.decode(latent, message=message)
 
 
-# --------------------------------------------------------------------
-# Model info
-# --------------------------------------------------------------------
-
 def get_model_info() -> dict:
-    """Get information about the DAC-VAE model configuration.
-
-    Returns
-    -------
-    dict with model specifications
-    """
+    """Get information about the DAC-VAE model configuration."""
     return {
         "sample_rate": 48000,
         "encoder_rates": [2, 8, 10, 12],
@@ -937,21 +895,18 @@ def get_model_info() -> dict:
 
 
 if __name__ == "__main__":
-    # Quick test
     print("DAC-VAE Model Info:")
     info = get_model_info()
     for k, v in info.items():
         print(f"  {k}: {v}")
 
-    # Test with random audio
     print("\nTesting with random audio...")
     model = DACVAE()
-    audio = torch.randn(1, 1, 48000)  # 1 second at 48kHz
+    audio = torch.randn(1, 1, 48000)
 
     latent = model.encode(audio)
     print(f"  Input audio shape: {audio.shape}")
     print(f"  Latent shape: {latent.shape}")
-    print(f"  Expected latent length: {48000 // 1920} = 25 frames")
 
     recon = model.decode(latent)
     print(f"  Reconstructed audio shape: {recon.shape}")
